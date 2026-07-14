@@ -11,7 +11,7 @@ from sklearn.metrics import accuracy_score
 # ==========================================
 # WEB PAGE CONFIGURATION
 # ==========================================
-st.set_page_config(page_title="Smart Order Trcking System", page_icon="🚚", layout="wide")
+st.set_page_config(page_title="Smart Order Tracking System", page_icon="🚚", layout="wide")
 
 st.markdown("""
     <div style='background-color:#1565C0; padding:15px; border-radius:10px; text-align:center;'>
@@ -77,7 +77,7 @@ else:
     tab1, tab2, tab3 = st.tabs([" Dashboard & Statistics", " GPS Tracking Map", " AI Prediction & Search"])
 
     # ------------------------------------------
-    # TAB 1: DASHBOARD
+    # TAB 1: DASHBOARD 
     # ------------------------------------------
     with tab1:
         st.subheader("📦 Order Overview")
