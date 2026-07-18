@@ -77,7 +77,7 @@ else:
     tab1, tab2, tab3 = st.tabs([" Dashboard & Statistics", " GPS Tracking Map", " AI Prediction & Search"])
 
     # ------------------------------------------
-    # TAB 1: DASHBOARD & STATISTIC
+    # TAB 1: DASHBOARD & STATISTICS
     # ------------------------------------------
     with tab1:
         st.subheader("📦 Order Overview")
