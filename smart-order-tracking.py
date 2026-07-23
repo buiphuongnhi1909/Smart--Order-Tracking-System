@@ -1,206 +1,451 @@
-import streamlit as st
+import io, re
+
+import numpy as np
 import pandas as pd
+import streamlit as st
 import folium
 from streamlit_folium import st_folium
 import matplotlib.pyplot as plt
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import LabelEncoder
+
 from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
 
-# ==========================================
-# WEB PAGE CONFIGURATION
-# ==========================================
-st.set_page_config(page_title="Smart Order Trcking System", page_icon="🚚", layout="wide")
+# =========================
+# Page setup
+# =========================
+st.set_page_config(
+    page_title="Smart Order Tracking System",
+    page_icon="🚚",
+    layout="wide"
+)
 
 st.markdown("""
-    <div style='background-color:#1565C0; padding:15px; border-radius:10px; text-align:center;'>
-        <h1 style='color:white; margin:0;'>🚚 SMART ORDER TRACKING SYSTEM USING AI</h1>
-        <p style='color:white; margin:0;'>Logistics Order Tracking & AI Prediction Platform </p>
-    </div>
-    <br>
+<div style="background:#1565C0;padding:18px;border-radius:10px;text-align:center;">
+    <h1 style="color:white;margin:0;">🚚 SMART ORDER TRACKING SYSTEM USING AI</h1>
+    <p style="color:white;margin:0;">On-Time Delivery KPI Monitoring and Shipment Risk Analysis</p>
+</div><br>
 """, unsafe_allow_html=True)
 
-# ==========================================
-# DATA PROCESSING & AI TRAINING (Logistic Regression)
-# ==========================================
-@st.cache_data
-def load_and_train_model(file):
-    df_primary = pd.read_excel(file, sheet_name="Primary data")
-    df_ai = pd.read_excel(file, sheet_name="Refined")
+NULL_TOKENS = {"", "NULL", "NA", "N/A", "NONE", "NAN"}
 
-    # Clean data
-    df_primary = df_primary.drop_duplicates().dropna(subset=["BookingID"])
+# =========================
+# Data loading + model
+# =========================
+def clean_text(series, default="Unknown"):
+    s = series.astype(str).str.strip()
+    return s.mask(s.str.upper().isin(NULL_TOKENS), default).astype(str)
 
-    # Encode condition text
-    le_condition = LabelEncoder()
-    df_ai["condition_encoded"] = le_condition.fit_transform(df_ai["condition_text"].astype(str))
+def get_value(df, label):
+    row = df[df.iloc[:, 0].astype(str).str.strip().eq(label)]
+    if row.empty:
+        return None
+    value = pd.to_numeric(row.iloc[0, 1], errors="coerce")
+    return None if pd.isna(value) else int(value)
 
-    # Feature Selection (Exact match with untitled5.py)
-    features = [
-        "Fixed Costs",
-        "Maintenance",
-        "condition_encoded"
-    ]
-    target = "On time Delivery"
+def get_target_rate(df, default=90.0):
+    for cell in df.to_numpy().flatten():
+        match = re.search(r"target\s*:\s*([\d.]+)\s*%", str(cell), re.I)
+        if match:
+            return float(match.group(1))
+    return default
 
-    data = df_ai[features + [target]].copy()
-    data.dropna(inplace=True)
+@st.cache_data(show_spinner=False)
+def load_data_and_train(file_bytes):
+    excel = pd.ExcelFile(io.BytesIO(file_bytes))
+    sheet_names = {s.replace(" ", "").lower(): s for s in excel.sheet_names}
 
-    X = data[features]
-    y = data[target]
+    dashboard_sheet = sheet_names.get("sheet2")
+    primary_sheet = sheet_names.get("primarydata")
 
-    # Train Logistic Regression
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    model = LogisticRegression(max_iter=1000)
+    if dashboard_sheet is None or primary_sheet is None:
+        raise ValueError("The Excel file must contain 'Sheet2' and 'Primary data'.")
+
+    df_dash = pd.read_excel(
+        io.BytesIO(file_bytes),
+        sheet_name=dashboard_sheet,
+        header=None,
+        keep_default_na=False
+    )
+
+    df = pd.read_excel(
+        io.BytesIO(file_bytes),
+        sheet_name=primary_sheet,
+        keep_default_na=False
+    )
+
+    df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")].copy()
+    df["BookingID"] = clean_text(df["BookingID"], default="")
+    df = df[~df["BookingID"].str.upper().isin(NULL_TOKENS)].drop_duplicates().copy()
+
+    status = (
+        df["Status"].astype(str)
+        .str.strip().str.lower()
+        .str.replace(r"[\s_-]+", " ", regex=True)
+    )
+    df["target"] = status.map({
+        "on time": 1,
+        "ontime": 1,
+        "delay": 0,
+        "delayed": 0
+    })
+    df = df.dropna(subset=["target"]).copy()
+    df["target"] = df["target"].astype(int)
+    df["Status"] = df["target"].map({1: "On Time", 0: "Delay"})
+
+    dashboard_on_time = get_value(df_dash, "On Time")
+    dashboard_delay = get_value(df_dash, "Delay")
+    dashboard_total = get_value(df_dash, "Grand Total")
+
+    primary_total = len(df)
+    primary_on_time = int(df["target"].sum())
+    primary_delay = primary_total - primary_on_time
+
+    dashboard_on_time = primary_on_time if dashboard_on_time is None else dashboard_on_time
+    dashboard_delay = primary_delay if dashboard_delay is None else dashboard_delay
+    dashboard_total = dashboard_on_time + dashboard_delay if dashboard_total is None else dashboard_total
+
+    target_rate = get_target_rate(df_dash)
+    current_rate = dashboard_on_time / dashboard_total * 100
+    gap = max(target_rate - current_rate, 0)
+    required_on_time = int(np.ceil(dashboard_total * target_rate / 100))
+    additional_needed = max(required_on_time - dashboard_on_time, 0)
+
+    cat_features = ["GpsProvider", "Market/Regular ", "vehicleType", "Month"]
+    num_features = ["TRANSPORTATION_DISTANCE_IN_KM"]
+    features = cat_features + num_features
+
+    for col in cat_features:
+        if col not in df.columns:
+            df[col] = "Unknown"
+        df[col] = clean_text(df[col])
+
+    df["TRANSPORTATION_DISTANCE_IN_KM"] = pd.to_numeric(
+        clean_text(df["TRANSPORTATION_DISTANCE_IN_KM"], default=np.nan),
+        errors="coerce"
+    )
+    total_distance = df["TRANSPORTATION_DISTANCE_IN_KM"].sum(skipna=True)
+    distance_median = df["TRANSPORTATION_DISTANCE_IN_KM"].median()
+    distance_median = 0 if pd.isna(distance_median) else distance_median
+    df["TRANSPORTATION_DISTANCE_IN_KM"] = df["TRANSPORTATION_DISTANCE_IN_KM"].fillna(distance_median)
+
+    for col in ["Curr_lat", "Curr_lon"]:
+        df[col] = pd.to_numeric(clean_text(df[col], default=np.nan), errors="coerce")
+
+    X = df[features].copy()
+    y = df["target"]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    model = Pipeline([
+        ("preprocess", ColumnTransformer([
+            ("cat", OneHotEncoder(handle_unknown="ignore"), cat_features),
+            ("num", StandardScaler(), num_features)
+        ])),
+        ("classifier", LogisticRegression(max_iter=2000, random_state=42))
+    ])
+
     model.fit(X_train, y_train)
-    
-    acc = accuracy_score(y_test, model.predict(X_test))
+    accuracy = accuracy_score(y_test, model.predict(X_test))
 
-    return df_primary, df_ai, model, le_condition, acc
+    def group_performance(column):
+        result = df.groupby(column).agg(
+            Total_Shipments=("BookingID", "count"),
+            On_Time_Shipments=("target", "sum")
+        ).reset_index()
+        result["Delayed_Shipments"] = result["Total_Shipments"] - result["On_Time_Shipments"]
+        result["On_Time_Rate"] = result["On_Time_Shipments"] / result["Total_Shipments"] * 100
+        result = result[result["Total_Shipments"] >= 20]
+        return result.sort_values(["Delayed_Shipments", "On_Time_Rate"], ascending=[False, True])
 
-# ==========================================
-# SIDEBAR / FILE UPLOAD
-# ==========================================
+    kpi = {
+        "total": dashboard_total,
+        "on_time": dashboard_on_time,
+        "delay": dashboard_delay,
+        "target_rate": target_rate,
+        "current_rate": current_rate,
+        "gap": gap,
+        "required_on_time": required_on_time,
+        "additional_needed": additional_needed,
+        "total_distance": total_distance
+    }
+
+    groups = {
+        "vehicle": group_performance("vehicleType"),
+        "gps": group_performance("GpsProvider"),
+        "month": group_performance("Month")
+    }
+
+    return df, model, accuracy, features, cat_features, num_features, distance_median, kpi, groups
+
+def make_recommendations(groups):
+    recs = []
+    if not groups["vehicle"].empty:
+        r = groups["vehicle"].iloc[0]
+        recs.append(
+            f"Prioritize a review of vehicle type '{r['vehicleType']}', "
+            f"which records {int(r['Delayed_Shipments']):,} delayed shipments "
+            f"and an on-time rate of {r['On_Time_Rate']:.2f}%."
+        )
+    if not groups["gps"].empty:
+        r = groups["gps"].iloc[0]
+        recs.append(
+            f"Review shipment monitoring associated with GPS provider '{r['GpsProvider']}', "
+            f"which records {int(r['Delayed_Shipments']):,} delayed shipments "
+            f"and an on-time rate of {r['On_Time_Rate']:.2f}%."
+        )
+    if not groups["month"].empty:
+        r = groups["month"].iloc[0]
+        recs.append(
+            f"Investigate operational conditions in '{r['Month']}', "
+            f"which records {int(r['Delayed_Shipments']):,} delayed shipments "
+            f"and an on-time rate of {r['On_Time_Rate']:.2f}%."
+        )
+    recs.append("Focus first on high-volume delay groups and measure the on-time rate again against the 90% KPI.")
+    return recs
+
+# =========================
+# App
+# =========================
 st.sidebar.header("📂 Data Input")
 uploaded_file = st.sidebar.file_uploader("Upload Dataset (Excel format)", type=["xlsx"])
 
 if uploaded_file is None:
-    st.info("👈 Please upload the Dataset file on the left sidebar to begin.")
-else:
-    with st.spinner('Reading data and training AI model...'):
-        df_primary, df_ai, model, le_condition, accuracy = load_and_train_model(uploaded_file)
-    
-    st.sidebar.success(f"✅ AI Model Ready! Accuracy: {accuracy*100:.2f}%")
+    st.info("👈 Please upload the dataset file on the left sidebar to begin.")
+    st.stop()
 
-    # Create 3 Tabs
-    tab1, tab2, tab3 = st.tabs([" Dashboard ", " Shipment Route Visualization ", " Shipment Analysis "])
+with st.spinner("Reading data and training AI model..."):
+    df, model, accuracy, features, cat_features, num_features, distance_median, kpi, groups = load_data_and_train(uploaded_file.getvalue())
 
-    # ------------------------------------------
-    # TAB 1: DASHBOARD
-    # ------------------------------------------
-    with tab1:
-        st.subheader("Historical Shipment Summary")
-        col1, col2, col3, col4 = st.columns(4)
-        total_orders = len(df_primary)
-        on_time = df_primary["ontime"].notna().sum()
-        delay = df_primary["delay"].notna().sum()
-        total_distance = df_primary["TRANSPORTATION_DISTANCE_IN_KM"].sum()
-        
-        col1.metric("Total Orders", total_orders)
-        col2.metric("On Time", f"{on_time}")
-        col3.metric("Delayed", f"{delay}")
-        col4.metric("Total Distance", f"{total_distance:.0f} km")
-        st.markdown("---")
-        st.subheader(" AI Prediction Summary")
-        st.write("**Prediction Target:** Delivery Status (On Time / Delayed)")
-        st.write("**Input Features:** Fixed Costs, Maintenance, Weather Condition")
-        st.write(f"**Model Accuracy:** {accuracy*100:.2f}%")
-        st.write( "**Business Purpose:** Predict the delivery status of future shipments to help logistics managers identify potential delivery risks before shipment execution, enabling proactive planning and operational decision-making."
+st.sidebar.success(f"✅ AI Model Ready! Accuracy: {accuracy * 100:.2f}%")
+
+tab1, tab2, tab3 = st.tabs(["Dashboard", "Route Map", "Shipment Analysis"])
+
+# =========================
+# Dashboard
+# =========================
+with tab1:
+    st.subheader("Historical Shipment Performance")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Shipments", f"{kpi['total']:,}")
+    c2.metric("On-Time Shipments", f"{kpi['on_time']:,}")
+    c3.metric("Delayed Shipments", f"{kpi['delay']:,}")
+    c4.metric("Total Distance", f"{kpi['total_distance']:,} km")
+
+    st.markdown("---")
+    st.subheader("90% On-Time Delivery Target Assessment")
+    if kpi["current_rate"] < kpi["target_rate"]:
+        status_text = "BELOW TARGET"
+        status_color = "#C62828"
+    else:
+        status_text = "TARGET ACHIEVED"
+        status_color = "#2E7D32"
+    c1, c2, c3, c4 = st.columns(4)
+    def kpi_card(column, title, value, color="#31333F", value_size=32):
+        card_html = (
+            '<div style="'
+            'border:1px solid #dddddd;'
+            'border-radius:12px;'
+            'padding:18px 20px;'
+            'height:135px;'
+            'box-sizing:border-box;'
+            'background-color:white;'
+            'overflow:hidden;'
+            '">'
+            f'<div style="'
+            'font-size:16px;'
+            'font-weight:500;'
+            'color:#31333F;'
+            'margin-bottom:28px;'
+            'white-space:nowrap;'
+            '">'
+            f'{title}'
+            '</div>'
+            f'<div style="'
+            f'font-size:{value_size}px;'
+            'font-weight:600;'
+            f'color:{color};'
+            'line-height:1;'
+            'white-space:nowrap;'
+            '">'
+            f'{value}'
+            '</div>'
+            '</div>'
         )
 
-        st.markdown("---")
-        col_chart1, col_chart2 = st.columns(2)
-        
-        with col_chart1:
-            st.markdown("**Delivery Statistics**")
-            fig1, ax1 = plt.subplots(figsize=(5,3))
-            ax1.bar(["On Time", "Delay"], [on_time, delay], color=['#2ca02c', '#d62728'])
-            st.pyplot(fig1)
+        column.markdown(
+            card_html,
+            unsafe_allow_html=True
+        )
 
-        with col_chart2:
-            st.markdown("**Top 10 Vehicle Types**")
-            top_vehicle = df_primary["vehicleType"].value_counts().head(10)
-            fig2, ax2 = plt.subplots(figsize=(5,3))
-            top_vehicle.plot(kind="bar", color='#1f77b4', ax=ax2)
-            plt.xticks(rotation=30, ha="right")
-            st.pyplot(fig2)
-
-    # ------------------------------------------
-    # TAB 2: GOOGLE MAP
-    # ------------------------------------------
-    with tab2:
-        st.subheader(" Shipment Route Visualization")
-        st.info(
-           """
-        This module visualizes historical shipment locations from the logistics dataset.It helps logistics managers review transportation activities, analyze shipment routes, and support future transportation planning.
-    """
+    kpi_card(
+        c1,
+        "Current On-Time Rate",
+        f"{kpi['current_rate']:.2f}%"
     )
-        map_df = df_primary.dropna(subset=["Curr_lat", "Curr_lon"])
-        
-        if not map_df.empty:
-            shipment_map = folium.Map(location=[map_df["Curr_lat"].mean(), map_df["Curr_lon"].mean()], zoom_start=6)
-            for _, row in map_df.head(100).iterrows(): 
-                popup_info = f"<b>ID:</b> {row['BookingID']}<br><b>Vehicle:</b> {row['vehicleType']}<br><b>To:</b> {row['Destination_Location']}"
-                folium.Marker(
-                    location=[row["Curr_lat"], row["Curr_lon"]],
-                    popup=popup_info,
-                    tooltip=row["BookingID"]
-                ).add_to(shipment_map)
-            
-            st_folium(shipment_map, width=1000, height=500)
+
+    kpi_card(
+        c2,
+        "Target On-Time Rate",
+        f"{kpi['target_rate']:.2f}%"
+    )
+
+    kpi_card(
+        c3,
+        "Gap to 90% Target",
+        f"{kpi['gap']:.2f}%"
+    )
+
+    kpi_card(
+        c4,
+        "KPI Status",
+        status_text,
+        color=status_color,
+        value_size=24
+    )
+    st.warning(
+        f"To reach the {kpi['target_rate']:.0f}% target at the current shipment volume, "
+        f"at least {kpi['required_on_time']:,} shipments must be delivered on time. "
+        f"Improvement equivalent to {kpi['additional_needed']:,} additional on-time shipments is required."
+    )
+
+    st.markdown("---")
+    st.subheader("AI Prediction Overview")
+    a1, a2, a3 = st.columns(3)
+    a1.info("**AI Prediction Output**\n\nPredicted Delivery Status\n\n**On Time / Delayed**")
+    a2.info("**Prediction Scope**\n\nIndividual shipments retrieved by **Booking ID**")
+    a3.info("**Input Factors**\n\nGPS Provider, Shipment Type, Vehicle Type, Month, and Distance")
+    st.success(
+        f"**Business Use:** The AI model identifies shipments with a high risk of delay and supports improvement toward the {kpi['target_rate']:.0f}% on-time delivery target."
+    )
+    fig, ax = plt.subplots(figsize=(4.8, 2.8))
+    bars = ax.bar(
+        ["Current Rate", "Target"],
+        [kpi["current_rate"], kpi["target_rate"]],
+        width=0.45
+    )
+
+    ax.set_ylim(0, 100)
+    ax.set_ylabel("Percentage (%)", fontsize=9)
+    ax.set_title("Current On-Time Rate vs Target", fontsize=11)
+    ax.tick_params(axis="both", labelsize=9)
+
+    for bar, value in zip(bars, [kpi["current_rate"], kpi["target_rate"]]):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            value + 2,
+            f"{value:.2f}%",
+            ha="center",
+            fontsize=9
+        )
+
+    fig.tight_layout()
+    st.pyplot(fig, use_container_width=False)
+
+    st.markdown("---")
+    st.subheader("Data-Based Improvement Priorities")
+    for i, rec in enumerate(make_recommendations(groups), start=1):
+        st.write(f"**{i}.** {rec}")
+
+# =========================
+# Route Map
+# =========================
+with tab2:
+    st.subheader("Shipment Route Visualization")
+    st.info("This module visualizes historical shipment locations and supports transportation review.")
+
+    map_df = df.dropna(subset=["Curr_lat", "Curr_lon"])
+    if map_df.empty:
+        st.warning("No valid GPS coordinates found.")
+    else:
+        m = folium.Map(
+            location=[map_df["Curr_lat"].mean(), map_df["Curr_lon"].mean()],
+            zoom_start=6
+        )
+
+        for _, row in map_df.head(100).iterrows():
+            popup = (
+                f"<b>Booking ID:</b> {row.get('BookingID', 'N/A')}<br>"
+                f"<b>Vehicle:</b> {row.get('vehicleType', 'N/A')}<br>"
+                f"<b>Status:</b> {row.get('Status', 'N/A')}<br>"
+                f"<b>Destination:</b> {row.get('Destination_Location', 'N/A')}"
+            )
+            folium.Marker(
+                [row["Curr_lat"], row["Curr_lon"]],
+                popup=popup,
+                tooltip=str(row.get("BookingID", "N/A"))
+            ).add_to(m)
+
+        st_folium(m, width=1200, height=550)
+
+# =========================
+# Shipment Analysis
+# =========================
+with tab3:
+    st.subheader("Shipment Analysis")
+    st.info(
+        "**Prediction logic:** Booking ID retrieves the shipment record. "
+        "The AI model then uses GPS Provider, Shipment Type, Vehicle Type, Month, and Distance to estimate delivery status."
+    )
+
+    booking_id = st.text_input("Enter Booking ID:")
+
+    if st.button("Search Order"):
+        result = df[df["BookingID"].astype(str).str.strip().eq(booking_id.strip())]
+
+        if booking_id.strip() == "":
+            st.warning("Please enter a Booking ID.")
+        elif result.empty:
+            st.error("❌ Booking ID not found.")
         else:
-            st.warning("No valid GPS coordinates found.")
+            shipment = result.iloc[0]
+            X_new = pd.DataFrame([{feature: shipment.get(feature, "Unknown") for feature in features}])
 
-    # ------------------------------------------
-    # TAB 3: Shipment Analysis
-    # ------------------------------------------
-    with tab3:
-        st.subheader(" Shipment Analysis")
-        
-        booking_id = st.text_input("Enter Booking ID:")
-        
-        if st.button("Search Order"):
-            if booking_id == "":
-                st.warning("Please enter a Booking ID.")
-            else:
-                primary_result = df_primary[df_primary["BookingID"].astype(str) == booking_id]
-                
-                if primary_result.empty:
-                    st.error("❌ Booking ID not found .")
+            for col in cat_features:
+                X_new[col] = clean_text(X_new[col])
+            for col in num_features:
+                X_new[col] = pd.to_numeric(X_new[col], errors="coerce").fillna(distance_median)
+
+            prediction = int(model.predict(X_new)[0])
+            prob = model.predict_proba(X_new)[0]
+            on_time_prob = prob[list(model.named_steps["classifier"].classes_).index(1)] * 100
+            delay_prob = 100 - on_time_prob
+
+            left, right = st.columns(2)
+
+            with left:
+                st.info("### ORDER & SHIPMENT INFORMATION")
+                st.write(f"**Booking ID:** {shipment.get('BookingID', 'N/A')}")
+                st.write(f"**Customer:** {shipment.get('customerNameCode', 'N/A')}")
+                st.write(f"**Material:** {shipment.get('Material Shipped', 'N/A')}")
+                st.markdown("---")
+                st.write(f"**Origin:** {shipment.get('Origin_Location', 'N/A')}")
+                st.write(f"**Destination:** {shipment.get('Destination_Location', 'N/A')}")
+                st.write(f"**Current Location:** {shipment.get('Current_Location', 'N/A')}")
+                st.write(f"**Distance:** {shipment.get('TRANSPORTATION_DISTANCE_IN_KM', 'N/A')} km")
+                st.write(f"**Planned ETA:** {shipment.get('Planned_ETA', 'N/A')}")
+
+            with right:
+                if prediction == 1:
+                    st.success("### 🟢 AI DELIVERY STATUS ASSESSMENT")
+                    st.write("## ON TIME")
+                    recommendation = "Maintain the planned schedule and continue routine shipment monitoring."
                 else:
-                    primary = primary_result.iloc[0]
-                    delivery_id = primary["BookingID"]
-                    refined_result = df_ai[df_ai["Delivery Id"].astype(str) == str(delivery_id)]
-                    
-                    if refined_result.empty:
-                        st.error("❌ No AI features found for this Booking ID.")
-                    else:
-                        refined = refined_result.iloc[0]
-                        
-                        # AI Prediction
-                        condition_code = le_condition.transform([refined["condition_text"]])[0]
-                        X_new = pd.DataFrame([{
-                            "Fixed Costs": refined["Fixed Costs"],
-                            "Maintenance": refined["Maintenance"],
-                            "condition_encoded": condition_code
-                        }])
-                        
-                        prediction = model.predict(X_new)[0]
-                        prob = model.predict_proba(X_new)[0]
-                        confidence = max(prob) * 100
-                        
-                        st.markdown("---")
-                        res_col1, res_col2 = st.columns(2)
-                        
-                        with res_col1:
-                            st.info(" **ORDER & SHIPMENT INFORMATION**")
-                            st.write(f"**Booking ID:** {primary['BookingID']}")
-                            st.write(f"**Customer:** {primary['customerNameCode']}")
-                            st.write(f"**Material:** {primary['Material Shipped']}")
-                            st.write(f"**Current Location:** {primary['Current_Location']}")
-                            st.write(f"**Distance:** {primary['TRANSPORTATION_DISTANCE_IN_KM']} km")
-                            st.write(f"**Planned ETA:** {primary['Planned_ETA']}")
-                            st.write(f"**Driver:** {primary['Driver_Name']}")
+                    st.error("### 🔴 AI DELIVERY STATUS ASSESSMENT")
+                    st.write("## DELAYED")
+                    recommendation = (
+                        "This shipment has a high delay probability. Prioritize follow-up for the selected vehicle type, "
+                        "verify GPS tracking availability, and review the long transportation distance before dispatch."
+                    )
 
-                        with res_col2:
-                            if prediction == 1:
-                                st.success(f"### 🟢 Delivery Status Assessment")
-                                st.write("**Final Status:** ON TIME")
-                                st.write(f"**Confidence Level:** {confidence:.2f}%")
-                                st.write("**Operational Recommendation:** Continue monitoring this shipment and maintain the planned delivery schedule.")
-                            else:
-                                st.error(f"### 🔴 Delivery Status Assessment")
-                                st.write("**Final Status:** DELAYED")
-                                st.write(f"**Confidence Level:** {confidence:.2f}%")
-                                st.write("**Operational Recommendation:** Prioritize operational follow-up and investigate possible causes of delay.")
+                st.write(f"**Estimated On-Time Probability:** {on_time_prob:.2f}%")
+                st.write(f"**Estimated Delay Probability:** {delay_prob:.2f}%")
+                st.markdown("---")
+                st.write(f"**Operational Recommendation:** {recommendation}")
+                st.write(f"**Vehicle:** {shipment.get('vehicleType', 'N/A')}")
+                st.write(f"**Driver:** {shipment.get('Driver_Name', 'N/A')}")
