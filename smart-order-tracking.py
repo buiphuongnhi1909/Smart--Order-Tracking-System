@@ -160,6 +160,7 @@ def load_data_and_train(file_bytes):
         ).reset_index()
         result["Delayed_Shipments"] = result["Total_Shipments"] - result["On_Time_Shipments"]
         result["On_Time_Rate"] = result["On_Time_Shipments"] / result["Total_Shipments"] * 100
+        result["Delay_Rate"] = 100 - result["On_Time_Rate"]
         result = result[result["Total_Shipments"] >= 20]
         return result.sort_values(["Delayed_Shipments", "On_Time_Rate"], ascending=[False, True])
 
@@ -172,42 +173,236 @@ def load_data_and_train(file_bytes):
         "gap": gap,
         "required_on_time": required_on_time,
         "additional_needed": additional_needed,
-        "total_distance": total_distance
+        "total_distance": total_distance,
+        "overall_delay_rate": primary_delay / primary_total * 100,
+        "distance_threshold": df["TRANSPORTATION_DISTANCE_IN_KM"].quantile(0.75)
     }
+
+    long_distance_rows = df[
+        df["TRANSPORTATION_DISTANCE_IN_KM"] >= kpi["distance_threshold"]
+    ]
+
+    if long_distance_rows.empty:
+        kpi["long_distance_delay_rate"] = 0.0
+        kpi["long_distance_shipments"] = 0
+    else:
+        kpi["long_distance_delay_rate"] = (
+            1 - long_distance_rows["target"].mean()
+        ) * 100
+        kpi["long_distance_shipments"] = len(long_distance_rows)
 
     groups = {
         "vehicle": group_performance("vehicleType"),
-        "gps": group_performance("GpsProvider"),
+        "shipment": group_performance("Market/Regular "),
         "month": group_performance("Month")
     }
 
     return df, model, accuracy, features, cat_features, num_features, distance_median, kpi, groups
 
-def make_recommendations(groups):
-    recs = []
-    if not groups["vehicle"].empty:
-        r = groups["vehicle"].iloc[0]
-        recs.append(
-            f"Prioritize a review of vehicle type '{r['vehicleType']}', "
-            f"which records {int(r['Delayed_Shipments']):,} delayed shipments "
-            f"and an on-time rate of {r['On_Time_Rate']:.2f}%."
+def get_group_result(table, column, value):
+    """Return the historical performance row matching one shipment factor."""
+    matched = table[table[column].astype(str).eq(str(value))]
+    return None if matched.empty else matched.iloc[0]
+
+
+def highest_risk_row(table):
+    """Return the group with the highest historical delay rate."""
+    if table.empty:
+        return None
+    return table.sort_values(
+        ["Delay_Rate", "Total_Shipments"],
+        ascending=[False, False]
+    ).iloc[0]
+
+
+def dashboard_risk_items(groups, kpi):
+    """Create the four system-level delay risks displayed on the Dashboard."""
+    items = []
+
+    vehicle = highest_risk_row(groups["vehicle"])
+    if vehicle is not None:
+        items.append({
+            "title": "Vehicle Risk",
+            "evidence": (
+                f"vehicleType '{vehicle['vehicleType']}' is associated with a "
+                f"{vehicle['Delay_Rate']:.2f}% historical delay rate across "
+                f"{int(vehicle['Total_Shipments']):,} shipments."
+            ),
+            "mitigation": (
+                "Inspect vehicle readiness, review maintenance records, and "
+                "consider assigning a more suitable vehicle before dispatch."
+            )
+        })
+
+    shipment_type = highest_risk_row(groups["shipment"])
+    if shipment_type is not None:
+        items.append({
+            "title": "Shipment Type Risk",
+            "evidence": (
+                f"Market/Regular '{shipment_type['Market/Regular ']}' is associated "
+                f"with a {shipment_type['Delay_Rate']:.2f}% historical delay rate "
+                f"across {int(shipment_type['Total_Shipments']):,} shipments."
+            ),
+            "mitigation": (
+                "Review handling requirements and prioritize operational "
+                "follow-up for this shipment type."
+            )
+        })
+
+    month = highest_risk_row(groups["month"])
+    if month is not None:
+        items.append({
+            "title": "Operating-Period Risk",
+            "evidence": (
+                f"Month '{month['Month']}' is associated with a "
+                f"{month['Delay_Rate']:.2f}% historical delay rate across "
+                f"{int(month['Total_Shipments']):,} shipments."
+            ),
+            "mitigation": (
+                "Allocate additional vehicles or drivers and prepare a backup "
+                "operating plan for this period."
+            )
+        })
+
+    items.append({
+        "title": "Long-Distance Risk",
+        "evidence": (
+            f"Shipments of at least {kpi['distance_threshold']:,.0f} km record a "
+            f"{kpi['long_distance_delay_rate']:.2f}% historical delay rate."
+        ),
+        "mitigation": (
+            "Review the route, departure time, travel allowance, and backup "
+            "delivery plan before dispatch."
         )
-    if not groups["gps"].empty:
-        r = groups["gps"].iloc[0]
-        recs.append(
-            f"Review shipment monitoring associated with GPS provider '{r['GpsProvider']}', "
-            f"which records {int(r['Delayed_Shipments']):,} delayed shipments "
-            f"and an on-time rate of {r['On_Time_Rate']:.2f}%."
+    })
+
+    return items
+
+
+def shipment_delay_risks(shipment, groups, kpi):
+    """
+    Identify shipment-specific risks from Vehicle Type, Shipment Type,
+    Month, and Transportation Distance. GPS Provider is excluded.
+    """
+    risks = []
+
+    checks = [
+        (
+            "Vehicle-related risk",
+            groups["vehicle"],
+            "vehicleType",
+            shipment.get("vehicleType", "Unknown"),
+            "Inspect vehicle readiness and consider assigning a more suitable "
+            "vehicle before dispatch."
+        ),
+        (
+            "Shipment-type risk",
+            groups["shipment"],
+            "Market/Regular ",
+            shipment.get("Market/Regular ", "Unknown"),
+            "Review handling requirements and prioritize operational follow-up."
+        ),
+        (
+            "Operating-period risk",
+            groups["month"],
+            "Month",
+            shipment.get("Month", "Unknown"),
+            "Allocate additional operating resources and prepare a backup "
+            "delivery plan."
         )
-    if not groups["month"].empty:
-        r = groups["month"].iloc[0]
-        recs.append(
-            f"Investigate operational conditions in '{r['Month']}', "
-            f"which records {int(r['Delayed_Shipments']):,} delayed shipments "
-            f"and an on-time rate of {r['On_Time_Rate']:.2f}%."
-        )
-    recs.append("Focus first on high-volume delay groups and measure the on-time rate again against the 90% KPI.")
-    return recs
+    ]
+
+    for title, table, column, value, mitigation in checks:
+        row = get_group_result(table, column, value)
+        if row is None:
+            continue
+
+        if row["Delay_Rate"] >= kpi["overall_delay_rate"]:
+            risks.append({
+                "title": title,
+                "evidence": (
+                    f"{column.strip()} '{value}' is associated with a "
+                    f"{row['Delay_Rate']:.2f}% historical delay rate across "
+                    f"{int(row['Total_Shipments']):,} shipments."
+                ),
+                "mitigation": mitigation,
+                "score": float(row["Delay_Rate"])
+            })
+
+    distance = float(
+        pd.to_numeric(
+            pd.Series([
+                shipment.get(
+                    "TRANSPORTATION_DISTANCE_IN_KM",
+                    kpi["distance_threshold"]
+                )
+            ]),
+            errors="coerce"
+        ).fillna(kpi["distance_threshold"]).iloc[0]
+    )
+
+    if distance >= kpi["distance_threshold"]:
+        risks.append({
+            "title": "Long-distance risk",
+            "evidence": (
+                f"The transportation distance is {distance:,.0f} km, which is "
+                f"at or above the historical 75th-percentile threshold of "
+                f"{kpi['distance_threshold']:,.0f} km."
+            ),
+            "mitigation": (
+                "Review the route, departure schedule, travel-time allowance, "
+                "and backup delivery plan before dispatch."
+            ),
+            "score": 100.0
+        })
+
+    return sorted(
+        risks,
+        key=lambda item: item["score"],
+        reverse=True
+    )[:4]
+
+
+def risk_card(title, evidence, mitigation):
+    """Render one risk card without Markdown indentation errors."""
+    card_html = (
+        '<div style="'
+        'border:1px solid #dddddd;'
+        'border-radius:10px;'
+        'padding:18px;'
+        'margin-bottom:14px;'
+        'background:#ffffff;'
+        'min-height:230px;'
+        'box-sizing:border-box;'
+        '">'
+        '<div style="'
+        'color:#C62828;'
+        'font-size:18px;'
+        'font-weight:700;'
+        'margin-bottom:16px;'
+        '">'
+        f'⚠️ {title}'
+        '</div>'
+        '<div style="margin-bottom:12px;">'
+        '<b>Risk evidence:</b>'
+        '</div>'
+        '<div style="margin-bottom:16px;">'
+        f'{evidence}'
+        '</div>'
+        '<div style="margin-bottom:10px;">'
+        '<b>Mitigation action:</b>'
+        '</div>'
+        '<div>'
+        f'{mitigation}'
+        '</div>'
+        '</div>'
+    )
+
+    st.markdown(
+        card_html,
+        unsafe_allow_html=True
+    )
+
 
 # =========================
 # App
@@ -235,79 +430,19 @@ with tab1:
     c1.metric("Total Shipments", f"{kpi['total']:,}")
     c2.metric("On-Time Shipments", f"{kpi['on_time']:,}")
     c3.metric("Delayed Shipments", f"{kpi['delay']:,}")
-    c4.metric("Total Distance", f"{kpi['total_distance']:,} km")
+    c4.metric("Total Distance", f"{kpi['total_distance']:,.0f} km")
 
     st.markdown("---")
     st.subheader("90% On-Time Delivery Target Assessment")
-    if kpi["current_rate"] < kpi["target_rate"]:
-        status_text = "BELOW TARGET"
-        status_color = "#C62828"
-    else:
-        status_text = "TARGET ACHIEVED"
-        status_color = "#2E7D32"
     c1, c2, c3, c4 = st.columns(4)
-    def kpi_card(column, title, value, color="#31333F", value_size=32):
-        card_html = (
-            '<div style="'
-            'border:1px solid #dddddd;'
-            'border-radius:12px;'
-            'padding:18px 20px;'
-            'height:135px;'
-            'box-sizing:border-box;'
-            'background-color:white;'
-            'overflow:hidden;'
-            '">'
-            f'<div style="'
-            'font-size:16px;'
-            'font-weight:500;'
-            'color:#31333F;'
-            'margin-bottom:28px;'
-            'white-space:nowrap;'
-            '">'
-            f'{title}'
-            '</div>'
-            f'<div style="'
-            f'font-size:{value_size}px;'
-            'font-weight:600;'
-            f'color:{color};'
-            'line-height:1;'
-            'white-space:nowrap;'
-            '">'
-            f'{value}'
-            '</div>'
-            '</div>'
-        )
+    c1.metric("Current On-Time Rate", f"{kpi['current_rate']:.2f}%")
+    c2.metric("Target On-Time Rate", f"{kpi['target_rate']:.2f}%")
+    c3.metric("Gap to 90% Target", f"{kpi['gap']:.2f}%")
+    if kpi["current_rate"] < kpi["target_rate"]:
+        c4.error("BELOW TARGET")
+    else:
+        c4.success("TARGET ACHIEVED")
 
-        column.markdown(
-            card_html,
-            unsafe_allow_html=True
-        )
-
-    kpi_card(
-        c1,
-        "Current On-Time Rate",
-        f"{kpi['current_rate']:.2f}%"
-    )
-
-    kpi_card(
-        c2,
-        "Target On-Time Rate",
-        f"{kpi['target_rate']:.2f}%"
-    )
-
-    kpi_card(
-        c3,
-        "Gap to 90% Target",
-        f"{kpi['gap']:.2f}%"
-    )
-
-    kpi_card(
-        c4,
-        "KPI Status",
-        status_text,
-        color=status_color,
-        value_size=24
-    )
     st.warning(
         f"To reach the {kpi['target_rate']:.0f}% target at the current shipment volume, "
         f"at least {kpi['required_on_time']:,} shipments must be delivered on time. "
@@ -323,34 +458,30 @@ with tab1:
     st.success(
         f"**Business Use:** The AI model identifies shipments with a high risk of delay and supports improvement toward the {kpi['target_rate']:.0f}% on-time delivery target."
     )
+
     fig, ax = plt.subplots(figsize=(4.8, 2.8))
-    bars = ax.bar(
-        ["Current Rate", "Target"],
-        [kpi["current_rate"], kpi["target_rate"]],
-        width=0.45
-    )
-
+    bars = ax.bar(["Current On-Time Rate", "Target"], [kpi["current_rate"], kpi["target_rate"]])
     ax.set_ylim(0, 100)
-    ax.set_ylabel("Percentage (%)", fontsize=9)
-    ax.set_title("Current On-Time Rate vs Target", fontsize=11)
-    ax.tick_params(axis="both", labelsize=9)
-
+    ax.set_ylabel("Percentage (%)")
+    ax.set_title("Current On-Time Performance vs. 90% Target")
     for bar, value in zip(bars, [kpi["current_rate"], kpi["target_rate"]]):
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            value + 2,
-            f"{value:.2f}%",
-            ha="center",
-            fontsize=9
-        )
-
+        ax.text(bar.get_x() + bar.get_width() / 2, value + 2, f"{value:.2f}%", ha="center")
     fig.tight_layout()
     st.pyplot(fig, use_container_width=False)
 
     st.markdown("---")
-    st.subheader("Data-Based Improvement Priorities")
-    for i, rec in enumerate(make_recommendations(groups), start=1):
-        st.write(f"**{i}.** {rec}")
+    st.subheader("Key Delay Risks and Mitigation Actions")
+
+    dashboard_risks = dashboard_risk_items(groups, kpi)
+    risk_columns = st.columns(2)
+
+    for i, risk in enumerate(dashboard_risks):
+        with risk_columns[i % 2]:
+            risk_card(
+                risk["title"],
+                risk["evidence"],
+                risk["mitigation"]
+            )
 
 # =========================
 # Route Map
@@ -415,6 +546,7 @@ with tab3:
             prob = model.predict_proba(X_new)[0]
             on_time_prob = prob[list(model.named_steps["classifier"].classes_).index(1)] * 100
             delay_prob = 100 - on_time_prob
+            identified_risks = shipment_delay_risks(shipment, groups, kpi)
 
             left, right = st.columns(2)
 
@@ -439,8 +571,7 @@ with tab3:
                     st.error("### 🔴 AI DELIVERY STATUS ASSESSMENT")
                     st.write("## DELAYED")
                     recommendation = (
-                        "This shipment has a high delay probability. Prioritize follow-up for the selected vehicle type, "
-                        "verify GPS tracking availability, and review the long transportation distance before dispatch."
+                        "Apply the mitigation actions linked to the identified delay risks."
                     )
 
                 st.write(f"**Estimated On-Time Probability:** {on_time_prob:.2f}%")
@@ -449,3 +580,31 @@ with tab3:
                 st.write(f"**Operational Recommendation:** {recommendation}")
                 st.write(f"**Vehicle:** {shipment.get('vehicleType', 'N/A')}")
                 st.write(f"**Driver:** {shipment.get('Driver_Name', 'N/A')}")
+
+            if prediction == 1:
+                st.success(
+                    "**Delay Risk Review:** No major delay risk requires immediate "
+                    "mitigation. Continue routine shipment monitoring."
+                )
+            else:
+                if identified_risks:
+                    top_risks = identified_risks[:2]
+
+                    risk_names = " and ".join(
+                        risk["title"] for risk in top_risks
+                    )
+
+                    mitigation_actions = "; ".join(
+                        risk["mitigation"] for risk in top_risks
+                    )
+
+                    st.warning(
+                        f"**Delay Risk Review:** {risk_names} identified.\n\n "
+                        f"**Mitigation:** {mitigation_actions}"
+                    )
+                else:
+                    st.warning(
+                        "**Delay Risk Review:** No single major risk factor was "
+                        "identified. Review vehicle readiness, route planning, and "
+                        "the departure schedule before dispatch."
+                    )        
